@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""
+GC content and compositional signal (delta-GC and GC-skew) analysis.
+
+Features
+--------
+- Accepts one or more FASTA or GenBank files (.fa/.fasta/.fna/.gb/.gbk/.genbank).
+- For each record (sequence) it computes:
+  - Global GC fraction.
+  - Windowed GC fraction.
+  - Delta-GC = windowed GC - global GC.
+  - GC-skew = (G - C) / (G + C) per window.
+- Outputs:
+  - <prefix>_summary_by_record.csv         (all file+record combinations)
+  - <prefix>_summary_unique_records.csv    (deduplicated by record_id)
+  - <prefix>_window_signals.csv            (all windows for all records)
+- Optionally generates PNG plots per record:
+  - <prefix>_<record>_deltaGC.png
+  - <prefix>_<record>_GCskew.png
+
+Dependencies
+-----------
+pip install biopython pandas numpy matplotlib
+
+Example
+-------
+python gc_composition_analysis.py \
+    --input sample1.fasta sample2.gbk \
+    --window 1000 --step 100 \
+    --out-prefix my_gc_analysis \
+    --plot
+"""
+
+import argparse
+import os
+import sys
+
+import numpy as np
+import pandas as pd
+from Bio import SeqIO
+import matplotlib.pyplot as plt
+
+
+def seq_to_str(seq_obj):
+    """Convert a Biopython Seq object to an uppercase string."""
+    return str(seq_obj).upper()
+
+
+def gc_fraction(seq_str):
+    """Return GC fraction = (G + C) / (A + T + G + C) for a sequence string."""
+    s = seq_str.upper()
+    g = s.count("G")
+    c = s.count("C")
+    a = s.count("A")
+    t = s.count("T")
+    denom = a + t + g + c
+    if denom == 0:
+        return np.
+    return (g + c) / float(denom)
+
+
+def gc_skew_value(seq_str):
+    """Return GC-skew = (G - C) / (G + C) for a sequence string."""
+    s = seq_str.upper()
+    g = s.count("G")
+    c = s.count("C")
+    denom = g + c
+    if denom == 0:
+        return np.
+    return (g - c) / float(denom)
+
+
+def sliding_windows(seq_str, window, step):
+    """
+    Generate sliding windows over a sequence string.
+
+    Returns
+    -------
+    starts : list of int
+        Window start positions (0-based).
+    centers : list of float
+        Window centers (in bp coordinates).
+    seqs : list of str
+        Window substring sequences.
+    """
+    n = len(seq_str)
+    if n == 0 or window <= 0 or step <= 0:
+        return [], [], []
+
+    starts = list(range(0, max(n - window + 1, 0), step))
+    centers = [s + window / 2.0 for s in starts]
+    seqs = [seq_str[s:s + window] for s in starts]
+    return starts, centers, seqs
+
+
+def compute_signals_for_sequence(seq_str, window, step):
+    """
+    Compute global GC, windowed GC, delta-GC and GC-skew for one sequence.
+
+    Parameters
+    ----------
+    seq_str : str
+        DNA sequence (A/C/G/T, case-insensitive).
+    window : int
+        Sliding-window size (bp).
+    step : int
+        Sliding-window step (bp).
+
+    Returns
+    -------
+    global_gc : float
+    signals_df : pandas.DataFrame
+        Columns: window_start, window_center, gc, delta_gc, gc_skew
+    """
+    starts, centers, win_seqs = sliding_windows(seq_str, window, step)
+    global_gc = gc_fraction(seq_str)
+
+    if len(win_seqs) == 0:
+        empty_df = pd.DataFrame(
+            {
+                "window_start": [],
+                "window_center": [],
+                "gc": [],
+                "delta_gc": [],
+                "gc_skew": [],
+            }
+        )
+        return global_gc, empty_df
+
+    gc_vals = np.array([gc_fraction(w) for w in win_seqs], dtype=float)
+    skew_vals = np.array([gc_skew_value(w) for w in win_seqs], dtype=float)
+    delta_gc_vals = gc_vals - global_gc
+
+    signals_df = pd.DataFrame(
+        {
+            "window_start": starts,
+            "window_center": centers,
+            "gc": gc_vals,
+            "delta_gc": delta_gc_vals,
+            "gc_skew": skew_vals,
+        }
+    )
+    return global_gc, signals_df
+
+
+def infer_format(filename):
+    """
+    Infer sequence file format from the extension.
+    Returns 'fasta' or 'genbank'.
+    """
+    lower = filename.lower()
+    if lower.endswith(".gb") or lower.endswith(".gbk") or lower.endswith(".genbank"):
+        return "genbank"
+    return "fasta"
+
+
+def parse_input_files(input_paths):
+    """
+    Parse all input FASTA/GenBank files into a DataFrame.
+
+    Returns
+    -------
+    seq_df : pandas.DataFrame
+        Columns: file, record_id, length_bp, sequence
+    """
+    records = []
+    for path in input_paths:
+        if not os.path.exists(path):
+            sys.stderr.write("Warning: file not found, skipping: " + path + "\n")
+            continue
+
+        fmt = infer_format(path)
+        try:
+            for rec in SeqIO.parse(path, fmt):
+                seq_str = seq_to_str(rec.seq)
+                records.append(
+                    {
+                        "file": path,
+                        "record_id": rec.id,
+                        "length_bp": len(seq_str),
+                        "sequence": seq_str,
+                    }
+                )
+        except Exception as e:
+            sys.stderr.write(
+                "Error parsing " + path + " as format " + fmt + ": " + str(e) + "\n"
+            )
+
+    if not records:
+        return pd.DataFrame(columns=["file", "record_id", "length_bp", "sequence"])
+
+    return pd.DataFrame(records)
+
+
+def analyze_sequences(seq_df, window, step):
+    """
+    Run GC and compositional signal analysis for all records.
+
+    Parameters
+    ----------
+    seq_df : pandas.DataFrame
+        As returned by parse_input_files.
+    window : int
+    step : int
+
+    Returns
+    -------
+    summary_df : pandas.DataFrame
+        Per file+record summary.
+    signals_df : pandas.DataFrame
+        Window-level signals for all records.
+    """
+    all_signal_tables = []
+    summary_rows = []
+
+    for idx in range(seq_df.shape[0]):
+        file_val = seq_df.loc[idx, "file"]
+        rec_id = seq_df.loc[idx, "record_id"]
+        seq_str = seq_df.loc[idx, "sequence"]
+
+        global_gc, sig_df = compute_signals_for_sequence(seq_str, window, step)
+
+        sig_df["file"] = file_val
+        sig_df["record_id"] = rec_id
+        sig_df["length_bp"] = len(seq_str)
+        sig_df["global_gc"] = global_gc
+        all_signal_tables.append(sig_df)
+
+        if sig_df.shape[0] > 0:
+            delta_gc = sig_df["delta_gc"].to_numpy()
+            gc_sk = sig_df["gc_skew"].to_numpy()
+            delta_gc_mean = float(np.nanmean(delta_gc))
+            delta_gc_sd = float(np.nanstd(delta_gc))
+            delta_gc_min = float(np.nanmin(delta_gc))
+            delta_gc_max = float(np.nanmax(delta_gc))
+            gc_skew_mean = float(np.nanmean(gc_sk))
+            gc_skew_sd = float(np.nanstd(gc_sk))
+        else:
+            delta_gc_mean = np.
+            delta_gc_sd = np.
+            delta_gc_min = np.
+            delta_gc_max = np.
+            gc_skew_mean = np.
+            gc_skew_sd = np.
+
+        summary_rows.append(
+            {
+                "file": file_val,
+                "record_id": rec_id,
+                "length_bp": len(seq_str),
+                "global_gc": global_gc,
+                "delta_gc_mean": delta_gc_mean,
+                "delta_gc_sd": delta_gc_sd,
+                "delta_gc_min": delta_gc_min,
+                "delta_gc_max": delta_gc_max,
+                "gc_skew_mean": gc_skew_mean,
+                "gc_skew_sd": gc_skew_sd,
+            }
+        )
+
+    if all_signal_tables:
+        signals_df = pd.concat(all_signal_tables, ignore_index=True)
+    else:
+        signals_df = pd.DataFrame(
+            columns=[
+                "window_start",
+                "window_center",
+                "gc",
+                "delta_gc",
+                "gc_skew",
+                "file",
+                "record_id",
+                "length_bp",
+                "global_gc",
+            ]
+        )
+
+    summary_df = pd.DataFrame(summary_rows)
+    return summary_df, signals_df
+
+
+def make_plots(signals_df, out_prefix, window, step):
+    """
+    Generate per-record PNG plots of delta-GC and GC-skew.
+
+    Parameters
+    ----------
+    signals_df : pandas.DataFrame
+    out_prefix : str
+    window : int
+    step : int
+    """
+    if signals_df.empty:
+        return
+
+    for rec_id in signals_df["record_id"].unique():
+        sub_df = signals_df[signals_df["record_id"] == rec_id].copy()
+        sub_df = sub_df.sort_values("window_center")
+
+        # Delta-GC plot
+        plt.figure(figsize=(10, 4))
+        plt.plot(sub_df["window_center"], sub_df["delta_gc"], linewidth=1)
+        plt.axhline(0, color="black", linewidth=1)
+        plt.xlabel("Position (bp, window center)")
+        plt.ylabel("Delta GC")
+        plt.title(
+            "Delta-GC (win="
+            + str(window)
+            + ", step="
+            + str(step)
+            + ") - "
+            + str(rec_id)
+        )
+        plt.tight_layout()
+        out_path_delta = out_prefix + "_" + str(rec_id) + "_deltaGC.png"
+        plt.savefig(out_path_delta, dpi=300)
+        plt.close()
+
+        # GC-skew plot
+        plt.figure(figsize=(10, 4))
+        plt.plot(sub_df["window_center"], sub_df["gc_skew"], linewidth=1)
+        plt.axhline(0, color="black", linewidth=1)
+        plt.xlabel("Position (bp, window center)")
+        plt.ylabel("GC-skew")
+        plt.title(
+            "GC-skew (win="
+            + str(window)
+            + ", step="
+            + str(step)
+            + ") - "
+            + str(rec_id)
+        )
+        plt.tight_layout()
+        out_path_skew = out_prefix + "_" + str(rec_id) + "_GCskew.png"
+        plt.savefig(out_path_skew, dpi=300)
+        plt.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="GC content and delta-GC / GC-skew compositional analysis."
+    )
+    parser.add_argument(
+        "--input",
+        "-i",
+        nargs="+",
+        required=True,
+        help="Input FASTA or GenBank files.",
+    )
+    parser.add_argument(
+        "--window",
+        "-w",
+        type=int,
+        default=1000,
+        help="Sliding-window size in bp (default: 1000).",
+    )
+    parser.add_argument(
+        "--step",
+        "-s",
+        type=int,
+        default=100,
+        help="Sliding-window step in bp (default: 100).",
+    )
+    parser.add_argument(
+        "--out-prefix",
+        "-o",
+        default="gc_analysis",
+        help="Output file prefix (default: gc_analysis).",
+    )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="If set, generate per-record PNG plots of delta-GC and GC-skew.",
+    )
+
+    args = parser.parse_args()
+
+    seq_df = parse_input_files(args.input)
+    if seq_df.empty:
+        sys.stderr.write("No valid sequences parsed; exiting.\n")
+        sys.exit(1)
+
+    print("Parsed sequences:")
+    print(seq_df[["file", "record_id", "length_bp"]])
+
+    summary_df, signals_df = analyze_sequences(seq_df, args.window, args.step)
+
+    # Record-level summary (file+record)
+    summary_path = args.out_prefix + "_summary_by_record.csv"
+    summary_df.to_csv(summary_path, index=False)
+
+    # Unique-record summary (deduplicate on record_id)
+    unique_summary_df = summary_df.drop_duplicates(subset=["record_id"]).copy()
+    unique_summary_path = args.out_prefix + "_summary_unique_records.csv"
+    unique_summary_df.to_csv(unique_summary_path, index=False)
+
+    # Window-level signals
+    signals_path = args.out_prefix + "_window_signals.csv"
+    signals_df.to_csv(signals_path, index=False)
+
+    print("Wrote record-level summary to:", summary_path)
+    print("Wrote unique-record summary to:", unique_summary_path)
+    print("Wrote window-level signals to:", signals_path)
+
+    if args.plot:
+        print("Generating plots...")
+        make_plots(signals_df, args.out_prefix, args.window, args.step)
+        print("Plots done.")
+
+
+if __name__ == "__main__":
+    main()
